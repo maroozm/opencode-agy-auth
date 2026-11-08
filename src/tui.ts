@@ -357,16 +357,30 @@ export const setupAgyUiTui: TuiPlugin = async (api: TuiPluginApi, options: Plugi
   const style: ThemeStyle | undefined = STYLES[styleKey];
   if (!style) return;
 
-  const jsonPath = path.join(os.tmpdir(), `opencode-agy-ui-${styleKey}.json`);
-  try {
-    writeFileSync(jsonPath, JSON.stringify(style.document));
-    await api.theme.install(jsonPath);
-    api.theme.set(style.themeName);
-  } catch (error) {
+  // Install every style so both stay selectable from the theme picker,
+  // then activate the configured one.
+  for (const candidate of Object.values(STYLES)) {
+    const jsonPath = path.join(os.tmpdir(), `opencode-agy-ui-${candidate.id}.json`);
+    try {
+      writeFileSync(jsonPath, JSON.stringify(candidate.document));
+      await api.theme.install(jsonPath);
+    } catch (error) {
+      if (candidate.id === style.id) {
+        api.ui.toast({
+          variant: "error",
+          title: "Antigravity UI",
+          message: `Failed to install the ${candidate.label} theme: ${String(error)}`,
+        });
+        return;
+      }
+    }
+  }
+
+  if (!api.theme.set(style.themeName)) {
     api.ui.toast({
-      variant: "error",
+      variant: "warning",
       title: "Antigravity UI",
-      message: `Failed to install the ${style.label} theme: ${String(error)}`,
+      message: `Could not activate the ${style.label} theme.`,
     });
     return;
   }
@@ -374,7 +388,7 @@ export const setupAgyUiTui: TuiPlugin = async (api: TuiPluginApi, options: Plugi
   api.ui.toast({
     variant: "success",
     title: "Antigravity UI",
-    message: `OpenCode UI theme set to ${style.label}.`,
+    message: `OpenCode UI theme set to ${style.label} (switch styles via Ctrl+P → Theme).`,
   });
 };
 
