@@ -1,15 +1,22 @@
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui";
 import type { PluginOptions } from "@opencode-ai/plugin";
 
 /**
- * Antigravity (agy) UI plugin for OpenCode.
+ * UI Look plugin for OpenCode.
  *
- * Installs and activates a custom OpenCode theme that makes the terminal UI
- * look like Claude Code ("claude") or Grok ("grok"). The theme document uses
- * the OpenCode theme format (`$schema`, `defs`, `theme` with per-mode colors).
+ * Installs custom OpenCode themes that make the terminal UI look like
+ * Claude Code ("claude-look") or Grok ("grok-look"). Themes are written
+ * to the global themes directory, where OpenCode discovers them and
+ * makes them selectable from the theme picker (Ctrl+P → Theme).
+ *
+ * Notes on the runtime API (OpenCode v2.x):
+ * - `context.ui.toast` is an object with a `show()` method in current
+ *   releases (a bare callable in newer plans), so both shapes are handled.
+ * - The plugin context does not expose a theme-switching service, so the
+ *   themes are installed by writing them next to the user's other themes.
  */
 
 export const THEME_SCHEMA = "https://opencode.ai/theme.json";
@@ -26,10 +33,18 @@ interface ThemeStyle {
   id: string;
   label: string;
   themeName: string;
+  fileName: string;
   document: ThemeDocument;
 }
 
-const CLAUDE_CODE_THEME: ThemeDocument = {
+type ToastMessage = {
+  title?: string;
+  message: string;
+  variant?: "info" | "success" | "warning" | "error";
+  duration?: number;
+};
+
+const CLAUDE_LOOK_THEME: ThemeDocument = {
   $schema: THEME_SCHEMA,
   defs: {
     dark_bg: "#262624",
@@ -182,7 +197,7 @@ const CLAUDE_CODE_THEME: ThemeDocument = {
   },
 };
 
-const GROK_THEME: ThemeDocument = {
+const GROK_LOOK_THEME: ThemeDocument = {
   $schema: THEME_SCHEMA,
   defs: {
     dark_bg: "#0a0a0f",
@@ -339,59 +354,113 @@ const STYLES: Record<string, ThemeStyle> = {
   claude: {
     id: "claude",
     label: "Claude Code",
-    themeName: "agy-claude",
-    document: CLAUDE_CODE_THEME,
+    themeName: "claude-look",
+    fileName: "claude-look.json",
+    document: CLAUDE_LOOK_THEME,
   },
   grok: {
     id: "grok",
     label: "Grok",
-    themeName: "agy-grok",
-    document: GROK_THEME,
+    themeName: "grok-look",
+    fileName: "grok-look.json",
+    document: GROK_LOOK_THEME,
   },
 };
 
-export const TUI_PLUGIN_ID = "agy-ui";
+export const TUI_PLUGIN_ID = "ui-look";
 
-export const setupAgyUiTui: TuiPlugin = async (api: TuiPluginApi, options: PluginOptions | undefined, meta) => {
+interface RuntimePaths {
+  readonly path?: { readonly state: string; readonly config: string; readonly worktree: string; readonly directory: string };
+}
+
+/** OpenCode's toast API is an object with `show()` today; some builds expose a bare callable. */
+function toastFor(api: TuiPluginApi): ((message: ToastMessage) => void) | undefined {
+  const value = (api as unknown as { ui?: { toast?: unknown } }).ui?.toast;
+  if (typeof value === "function") return (message) => value(message);
+  const show = value && typeof value === "object" ? (value as { show?: unknown }).show : undefined;
+  if (typeof show === "function") return (message) => show(message);
+  return undefined;
+}
+
+/** Best-effort immediate switch when a theme service (install/set) is exposed by a newer runtime. */
+async function applyWithThemeService(api: TuiPluginApi, style: ThemeStyle): Promise<boolean> {
+  const runtime = api as unknown as Record<string, unknown>;
+  const service = (runtime.themes ?? runtime.theme) as { install?: unknown; set?: unknown; has?: unknown } | undefined;
+  if (!service || typeof service !== "object") return false;
+  if (typeof service.install === "function" && typeof service.set === "function") {
+    for (const candidate of Object.values(STYLES)) {
+      const jsonPath = path.join(os.tmpdir(), `opencode-ui-look-${candidate.id}.json`);
+      writeFileSync(jsonPath, JSON.stringify(candidate.document));
+      await service.install(jsonPath);
+    }
+    return Boolean(service.set(style.themeName));
+  }
+  if (typeof service.has === "function" && typeof service.set === "function") {
+    return Boolean(service.has(style.themeName) && service.set(style.themeName));
+  }
+  return false;
+}
+
+/** Themes are discovered from `<config>/themes/*.json`; `state.path.config` may be a file or a directory. */
+function themesDirectory(api: TuiPluginApi): string {
+  const runtime = api as unknown as RuntimePaths;
+  const hinted = runtime.path?.config;
+  if (hinted) {
+    const looksLikeFile = path.basename(hinted).includes(".");
+    return path.join(looksLikeFile ? path.dirname(hinted) : hinted, "themes");
+  }
+  return path.join(os.homedir(), ".config", "opencode", "themes");
+}
+
+export const setupUiLookTui: TuiPlugin = async (api: TuiPluginApi, options: PluginOptions | undefined, meta) => {
   const styleKey = options?.style === "grok" ? "grok" : "claude";
   const style: ThemeStyle | undefined = STYLES[styleKey];
   if (!style) return;
 
-  // Install every style so both stay selectable from the theme picker,
-  // then activate the configured one.
-  for (const candidate of Object.values(STYLES)) {
-    const jsonPath = path.join(os.tmpdir(), `opencode-agy-ui-${candidate.id}.json`);
-    try {
-      writeFileSync(jsonPath, JSON.stringify(candidate.document));
-      await api.theme.install(jsonPath);
-    } catch (error) {
-      if (candidate.id === style.id) {
-        api.ui.toast({
-          variant: "error",
-          title: "Antigravity UI",
-          message: `Failed to install the ${candidate.label} theme: ${String(error)}`,
-        });
-        return;
+  const toast = toastFor(api);
+
+  // Fast path: a runtime that exposes the theme service switches instantly.
+  let activated = false;
+  try {
+    activated = await applyWithThemeService(api, style);
+  } catch {
+    activated = false;
+  }
+
+  const installed: string[] = [];
+  const failures: string[] = [];
+
+  // Always install the theme files so both looks stay selectable from Ctrl+P → Theme.
+  try {
+    const directory = themesDirectory(api);
+    mkdirSync(directory, { recursive: true });
+    for (const candidate of Object.values(STYLES)) {
+      try {
+        writeFileSync(path.join(directory, candidate.fileName), JSON.stringify(candidate.document));
+        installed.push(candidate.themeName);
+      } catch (error) {
+        failures.push(`${candidate.themeName}: ${String(error)}`);
       }
     }
+  } catch (error) {
+    failures.push(`themes directory: ${String(error)}`);
   }
 
-  if (!api.theme.set(style.themeName)) {
-    api.ui.toast({
-      variant: "warning",
-      title: "Antigravity UI",
-      message: `Could not activate the ${style.label} theme.`,
-    });
-    return;
-  }
+  const message = activated
+    ? `UI theme set to ${style.label}. Switch looks anytime via Ctrl+P → Theme.`
+    : installed.length > 0
+      ? `Themes installed: ${[...new Set([...installed])].join(", ")}. Pick one via Ctrl+P → Theme (or restart to refresh the list).`
+      : `Could not install themes. ${failures.join("; ")}`;
 
-  api.ui.toast({
-    variant: "success",
-    title: "Antigravity UI",
-    message: `OpenCode UI theme set to ${style.label} (switch styles via Ctrl+P → Theme).`,
+  toast?.({
+    title: "UI Look",
+    message,
+    variant: failures.length && installed.length === 0 ? "error" : activated ? "success" : "info",
   });
+
+  if (meta) {
+    // TuiPluginMeta is informational only; nothing to do here.
+  }
 };
 
-const agyUiTui: TuiPlugin = setupAgyUiTui;
-
-export default { id: TUI_PLUGIN_ID, setup: agyUiTui };
+export default { id: TUI_PLUGIN_ID, setup: setupUiLookTui };
